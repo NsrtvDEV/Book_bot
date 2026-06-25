@@ -10,6 +10,7 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardRemove,
 )
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,13 +33,13 @@ def is_admin(telegram_id: int) -> bool:
 
 
 class UploadBook(StatesGroup):
-    waiting_for_title = State()  # 1. Название
-    waiting_for_category = State()  # 2. Категория
-    waiting_for_author = State()  # 3. Автор
-    waiting_for_language = State()  # 4. Язык книги
-    waiting_for_file = State()  # 5. PDF файл
-    waiting_for_cover = State()  # 6. Обложка
-    waiting_for_description = State()  # 7. Описание
+    waiting_for_title = State()       # 1. Название
+    waiting_for_category = State()    # 2. Категория
+    waiting_for_author = State()      # 3. Автор
+    waiting_for_language = State()    # 4. Язык книги
+    waiting_for_file = State()        # 5. PDF файл
+    waiting_for_cover = State()       # 6. Обложка
+    waiting_for_description = State() # 7. Описание
 
 
 # ──────────────────────────────────────────────
@@ -60,58 +61,100 @@ async def cmd_upload(message: Message, state: FSMContext) -> None:
 
 
 # ──────────────────────────────────────────────
-# Шаг 2 — Категория
+# Шаг 2 — Категория (с поддержкой иерархии)
 # ──────────────────────────────────────────────
 
 
 @router.message(UploadBook.waiting_for_title, F.text)
-async def receive_title(
-    message: Message, state: FSMContext, session: AsyncSession
-) -> None:
+async def receive_title(message: Message, state: FSMContext, session: AsyncSession) -> None:
     await state.update_data(title=message.text.strip())
+    # Переводим в состояние категории ДО показа кнопок
+    await state.set_state(UploadBook.waiting_for_category)
+    await show_category_step(message, state, session)
 
+
+async def show_category_step(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    parent_id: int | None = None,
+) -> None:
     result = await session.execute(
-        select(Category).where(Category.is_active == True).order_by(Category.sort_order)
+        select(Category)
+        .where(Category.is_active == True, Category.parent_id == parent_id)
+        .order_by(Category.sort_order)
     )
     categories = result.scalars().all()
 
     if not categories:
+        # Категорий нет вообще — пропускаем шаг
         await state.update_data(category_id=None)
         await ask_author(message, state)
         return
 
     buttons = [
-        [KeyboardButton(text=f"{cat.emoji or ''} {cat.name_ru}")] for cat in categories
+        [InlineKeyboardButton(
+            text=f"{cat.emoji or ''} {cat.name_ru}",
+            callback_data=f"upload_cat:{cat.id}",
+        )]
+        for cat in categories
     ]
-    buttons.append([KeyboardButton(text="⏭ Пропустить")])
+    buttons.append([InlineKeyboardButton(text="⏭ Пропустить", callback_data="upload_cat_skip")])
 
-    await state.update_data(
-        categories={f"{cat.emoji or ''} {cat.name_ru}": cat.id for cat in categories}
-    )
     await message.answer(
         "📂 <b>Шаг 2/7</b>\n\nВыберите категорию:",
-        reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
-    await state.set_state(UploadBook.waiting_for_category)
+
+
+@router.callback_query(UploadBook.waiting_for_category, F.data.startswith("upload_cat:"))
+async def receive_category_callback(
+    callback: CallbackQuery, state: FSMContext, session: AsyncSession
+) -> None:
+    category_id = int(callback.data.split(":")[1])
+
+    # Проверяем — есть ли дочерние категории
+    result = await session.execute(
+        select(Category)
+        .where(Category.parent_id == category_id, Category.is_active == True)
+        .order_by(Category.sort_order)
+    )
+    children = result.scalars().all()
+
+    if children:
+        # Показываем подкатегории в том же сообщении
+        buttons = [
+            [InlineKeyboardButton(
+                text=f"{child.emoji or ''} {child.name_ru}",
+                callback_data=f"upload_cat:{child.id}",
+            )]
+            for child in children
+        ]
+        buttons.append([InlineKeyboardButton(text="⏭ Пропустить", callback_data="upload_cat_skip")])
+        await callback.message.edit_reply_markup(
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+        await callback.answer()
+        return
+
+    # Финальная категория — сохраняем и идём дальше
+    await state.update_data(category_id=category_id)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Категория выбрана ✅")
+    await ask_author(callback.message, state)
+
+
+@router.callback_query(UploadBook.waiting_for_category, F.data == "upload_cat_skip")
+async def skip_category_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(category_id=None)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer()
+    await ask_author(callback.message, state)
 
 
 # ──────────────────────────────────────────────
 # Шаг 3 — Автор
 # ──────────────────────────────────────────────
-
-
-@router.message(UploadBook.waiting_for_category, F.text)
-async def receive_category(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    categories = data.get("categories", {})
-
-    if message.text == "⏭ Пропустить":
-        await state.update_data(category_id=None)
-    else:
-        category_id = categories.get(message.text)
-        await state.update_data(category_id=category_id)
-
-    await ask_author(message, state)
 
 
 async def ask_author(message: Message, state: FSMContext) -> None:
@@ -245,7 +288,6 @@ async def receive_description(
     session.add(book)
     await session.flush()
 
-    data_book = await state.get_data() if False else data
     category_name = "—"
     if book.category_id:
         cat = await session.get(Category, book.category_id)
@@ -256,6 +298,10 @@ async def receive_description(
         f"📚 Название: <b>{book.title}</b>\n"
         f"✍️ Автор: {book.author or '—'}\n"
         f"📂 Категория: {category_name}\n"
-        f"🌐 Язык: {book.language}\n"
+        f"🌐 Язык: {book.language.value}\n"
         f"🆔 ID: {book.id}",
     )
+
+    
+
+

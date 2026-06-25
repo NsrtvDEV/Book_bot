@@ -66,7 +66,7 @@ class LanguageMiddleware(BaseMiddleware):
         user: User | None = data.get("user")
         data["lang"] = user.language.value if user else LanguageEnum.RU.value
         return await handler(event, data)
-    
+
 
 class BanCheckMiddleware(BaseMiddleware):
     async def __call__(
