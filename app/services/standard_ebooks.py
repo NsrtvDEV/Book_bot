@@ -122,4 +122,4 @@ class StandardEbooksService:
             return None
 
 
-standard_ebooks = StandardEbooksService()
+standard_ebooks = StandardEbooksService() 
