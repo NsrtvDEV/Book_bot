@@ -1,4 +1,5 @@
 """Open Library API — поиск и скачивание PDF."""
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
@@ -125,14 +126,30 @@ class OpenLibraryService:
         """
         Перебирает все издания книги и возвращает URL первого PDF < 49MB.
         Если все большие — возвращает URL наименьшего.
+
+        FIXED: раньше издания перебирались по одному в последовательном
+        for-цикле (каждое — отдельный HTTP-запрос к archive.org metadata).
+        Для книг с несколькими изданиями это заметно тормозило скачивание.
+        Теперь все метаданные запрашиваются параллельно, а выбор лучшего
+        издания делается после получения всех результатов.
         """
+        if not ia_ids:
+            return None
+
+        results = await asyncio.gather(
+            *[self._get_best_pdf_from_ia(ia_id) for ia_id in ia_ids],
+            return_exceptions=True,
+        )
+
         best_url = None
         best_size = None
 
-        for ia_id in ia_ids:
-            result = await self._get_best_pdf_from_ia(ia_id)
-            if not result:
+        for ia_id, result in zip(ia_ids, results):
+            if isinstance(result, Exception) or not result:
+                if isinstance(result, Exception):
+                    logger.error(f"Archive.org metadata error for {ia_id}: {result}")
                 continue
+
             url, size = result
             logger.info(f"{ia_id}: PDF size = {size / 1024 / 1024:.1f} MB")
 
@@ -211,4 +228,4 @@ class OpenLibraryService:
             return None
 
 
-open_library = OpenLibraryService()
+open_library = OpenLibraryService() 

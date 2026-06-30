@@ -91,7 +91,9 @@ class Category(Base):
         return getattr(self, f"name_{lang}", self.name_ru)
 
     def __repr__(self) -> str:
-        return f"<Category slug={self.slug}>"
+        # FIXED: раньше тут было self.slug — такого поля у модели нет вообще,
+        # любой repr(category) (логи, дебаггер, print) кидал AttributeError.
+        return f"<Category id={self.id} name_ru={self.name_ru!r}>"
 
 
 class Book(Base):
@@ -215,4 +217,4 @@ class WeeklyTop(Base):
     def __repr__(self) -> str:
         return (
             f"<WeeklyTop book={self.book_id} week={self.week_start} rank={self.rank}>"
-        )
+        ) 

@@ -11,7 +11,7 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 CATALOG_URL = "https://standardebooks.org/feeds/opds"
-SEARCH_URL = "https://standardebooks.org/ebooks?query={query}&per-page=6"
+OPDS_SEARCH_URL = "https://standardebooks.org/feeds/opds/all"
 
 
 @dataclass
@@ -43,11 +43,16 @@ class StandardEbooksService:
     async def search(self, query: str, limit: int = 3) -> list[StandardBook]:
         """Поиск через OPDS каталог Standard Ebooks."""
         session = await self._get_session()
-        url = f"https://standardebooks.org/feeds/opds/all?query={query}"
 
+        # FIXED: раньше запрос подставлялся прямо в URL через f-строку
+        # (f"...?query={query}"), без энкодинга. Любой запрос с пробелом,
+        # кириллицей или спецсимволом ломал URL — поиск либо возвращал 400/пустой
+        # ответ, либо искал не то, что было введено. Теперь aiohttp сам корректно
+        # энкодит query через params=.
         try:
-            async with session.get(url) as resp:
+            async with session.get(OPDS_SEARCH_URL, params={"query": query}) as resp:
                 if resp.status != 200:
+                    logger.warning(f"Standard Ebooks search status={resp.status} query={query!r}")
                     return []
                 text = await resp.text()
         except Exception as e:
@@ -119,6 +124,7 @@ class StandardEbooksService:
                     return None
                 return await resp.read()
         except Exception as e:
+            logger.error(f"Standard Ebooks cover error: {e}")
             return None
 
 

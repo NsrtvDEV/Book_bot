@@ -5,7 +5,7 @@ Archive.org — узбекская и русская коллекции книг
   https://archive.org/details/booksbylanguage_russian
 """
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 import aiohttp
 
@@ -46,16 +46,36 @@ class ArchiveUzService:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    async def _raw_search(self, params: dict) -> list[dict]:
+        session = await self._get_session()
+        try:
+            async with session.get(SEARCH_URL, params=params) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Archive.org search status={resp.status} params={params!r}")
+                    return []
+                data = await resp.json()
+        except Exception as e:
+            logger.error(f"Archive.org search error: {e}")
+            return []
+        return data.get("response", {}).get("docs", [])
+
     async def search(self, query: str, language: str = "uzb", limit: int = 3) -> list[ArchiveBook]:
         """
         Поиск книг на Archive.org.
         language: 'uzb' для узбекского, 'rus' для русского.
         Ищем по коллекции (а не по полю language, оно заполнено непоследовательно),
         и по title ИЛИ creator (имя автора тоже должно находиться).
-        """
-        session = await self._get_session()
 
+        FIXED: коллекции booksbylanguage_* реально существуют, но это скорее
+        "всё, что кто-то когда-то залил с такой меткой" (религиозные тексты,
+        словари), а не куратор полки литературной классики — по многим
+        конкретным авторам/книгам коллекция даёт 0 результатов, хотя книга
+        в принципе может лежать на archive.org под другой коллекцией.
+        Если поиск по collection: ничего не нашёл — пробуем второй заход
+        по полю language, без жёсткой привязки к конкретной коллекции.
+        """
         collection = COLLECTION_MAP.get(language)
+
         if collection:
             q = f'collection:{collection} AND (title:({query}) OR creator:({query})) AND mediatype:texts'
         else:
@@ -68,18 +88,18 @@ class ArchiveUzService:
             "page": 1,
             "output": "json",
         }
-        try:
-            async with session.get(SEARCH_URL, params=params) as resp:
-                if resp.status != 200:
-                    logger.warning(f"Archive.org search status={resp.status} q={q!r}")
-                    return []
-                data = await resp.json()
-        except Exception as e:
-            logger.error(f"Archive.org search error ({language}): {e}")
-            return []
-
-        docs = data.get("response", {}).get("docs", [])
+        docs = await self._raw_search(params)
         logger.info(f"[archive_uz] query={query!r} lang={language} found={len(docs)}")
+
+        if not docs and collection:
+            # Второй заход — без привязки к коллекции, по метаданному полю language.
+            # Не гарантия результата (поле language заполняется на archive.org
+            # непоследовательно), но шанс найти книгу, залитую без правильной
+            # метки коллекции, лучше, чем гарантированный 0.
+            q_fallback = f'(title:({query}) OR creator:({query})) AND language:{language} AND mediatype:texts'
+            params_fallback = {**params, "q": q_fallback}
+            docs = await self._raw_search(params_fallback)
+            logger.info(f"[archive_uz] fallback(no-collection) query={query!r} lang={language} found={len(docs)}")
 
         results = []
         for doc in docs:
@@ -180,4 +200,18 @@ class ArchiveUzService:
             return None
 
 
-archive_uz = ArchiveUzService() 
+# ── Синглтон ──────────────────────────────────────────────────────────────────
+archive_uz = ArchiveUzService()
+
+
+# ── Вспомогательные функции (используются в imwerden.py) ──────────────────────
+
+def normalize_uzbek_query(query: str) -> str:
+    """Убирает апострофы и обратные кавычки из узбекского текста."""
+    return query.replace("'", "").replace("`", "").replace("\u2019", "")
+
+
+def fuzzify(query: str) -> str:
+    """Добавляет fuzzy-операторы для поиска с опечатками (Solr/Lucene синтаксис)."""
+    words = query.split()
+    return " ".join(f"{w}~" for w in words if len(w) > 3) 

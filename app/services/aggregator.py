@@ -10,6 +10,7 @@
 """
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -22,6 +23,30 @@ from app.services.imwerden import imwerden
 logger = logging.getLogger(__name__)
 
 MAX_FILE_SIZE = 49 * 1024 * 1024  # 49 MB — лимит Telegram
+
+
+def normalize_title(title: str) -> str:
+    """Нормализует название книги для сравнения/дедупликации."""
+    return re.sub(r"\s+", " ", title or "").strip().lower()
+
+
+def _stringify_author(author) -> Optional[str]:
+    """
+    FIXED: некоторые источники (например, Gutenberg при нескольких авторах)
+    могут отдавать author как list, а не str. UnifiedBook.author объявлен
+    как Optional[str], но без приведения типа на границе list просачивался
+    дальше и ронял .strip() в дедупе с AttributeError.
+    """
+    if not author:
+        return None
+    if isinstance(author, (list, tuple, set)):
+        return ", ".join(str(a) for a in author if a) or None
+    return str(author)
+
+
+def _author_sort_key(author) -> str:
+    """Защитная версия приведения author к строке для использования как ключ дедупа."""
+    return (_stringify_author(author) or "").strip().lower()
 
 
 @dataclass
@@ -70,6 +95,30 @@ COPYRIGHT_MSG = {
         "📌 <a href='https://www.litres.ru/'>LitRes</a>"
     ),
 }
+
+# FIXED: раньше на ЛЮБУЮ неудачу скачивания (сеть, таймаут, файл слишком большой,
+# временно недоступен) показывалось сообщение про копирайт и ссылку купить книгу —
+# даже для источников, которые по определению public domain (Gutenberg,
+# Standard Ebooks, Archive.org, ImWerden). Теперь для них отдельное,
+# не вводящее в заблуждение сообщение.
+TECH_ERROR_MSG = {
+    "uz": (
+        "⚠️ <b>{title}</b> kitobini hozir yuklab bo'lmadi.\n"
+        "Birozdan keyin qayta urinib ko'ring."
+    ),
+    "ru": (
+        "⚠️ Не удалось скачать книгу <b>{title}</b> прямо сейчас.\n"
+        "Попробуйте ещё раз чуть позже."
+    ),
+    "en": (
+        "⚠️ Couldn't download <b>{title}</b> right now.\n"
+        "Please try again in a bit."
+    ),
+}
+
+# Источники, где отказ в скачивании реально может означать copyright/lending-only
+# (Open Library хранит и DRM-защищённые книги, доступные только на чтение онлайн).
+_COPYRIGHT_CAPABLE_SOURCES = {"Open Library"}
 
 
 def detect_query_language(query: str) -> str:
@@ -141,11 +190,13 @@ class BookAggregator:
                 continue
             unified.extend(result)
 
-        # Дедупликация по названию
+        # FIXED: раньше дедуп шёл по title.lower()[:30] — два разных тома одной
+        # серии ("Война и мир. Том 1" / "Том 2") могли слипнуться в одну запись.
+        # Теперь сравниваем нормализованную пару (title, author) целиком.
         seen = set()
         deduped = []
         for book in unified:
-            key = book.title.lower()[:30]
+            key = (normalize_title(book.title), _author_sort_key(book.author))
             if key not in seen:
                 seen.add(key)
                 deduped.append(book)
@@ -174,7 +225,7 @@ class BookAggregator:
             results = await gutenberg.search(query, limit)
             return [
                 UnifiedBook(
-                    title=b.title, author=b.author, cover_url=b.cover_url,
+                    title=b.title, author=_stringify_author(b.author), cover_url=b.cover_url,
                     source="Project Gutenberg",
                     source_id=b.pdf_url or b.epub_url or "",
                     languages=b.languages,
@@ -204,17 +255,25 @@ class BookAggregator:
 
     async def _search_archive_ru(self, query: str, limit: int) -> list[UnifiedBook]:
         try:
-            results = await archive_uz.search(query, language="rus", limit=limit + 10)
-            accessible = []
-            for b in results:
-                if await archive_uz.is_accessible(b.ia_id):
-                    accessible.append(UnifiedBook(
-                        title=b.title, author=b.author, cover_url=b.cover_url,
-                        source="Archive.org (RU)", source_id=b.ia_id,
-                        languages=["ru"],
-                    ))
-                if len(accessible) >= limit:
-                    break
+            results = await archive_uz.search(query, language="rus", limit=limit + 20)
+            logger.info(f"[archive_ru] raw_found={len(results)} for query={query!r}")
+
+            # FIXED: раньше is_accessible() вызывался последовательно в for-цикле —
+            # до 20+ HTTP-запросов к archive.org один за другим. Теперь параллельно.
+            flags = await asyncio.gather(
+                *[archive_uz.is_accessible(b.ia_id) for b in results],
+                return_exceptions=True,
+            )
+            accessible = [
+                UnifiedBook(
+                    title=b.title, author=b.author, cover_url=b.cover_url,
+                    source="Archive.org (RU)", source_id=b.ia_id,
+                    languages=["ru"],
+                )
+                for b, ok in zip(results, flags) if ok is True
+            ][:limit]
+
+            logger.info(f"[archive_ru] accessible_found={len(accessible)} for query={query!r}")
             return accessible
         except Exception as e:
             logger.error(f"Archive RU error: {e}")
@@ -223,20 +282,25 @@ class BookAggregator:
     async def _search_archive_uz(self, query: str, limit: int) -> list[UnifiedBook]:
         try:
             results = await archive_uz.search(query, language="uzb", limit=limit + 10)
-            accessible = []
-            for b in results:
-                if await archive_uz.is_accessible(b.ia_id):
-                    accessible.append(UnifiedBook(
-                        title=b.title, author=b.author, cover_url=b.cover_url,
-                        source="Archive.org (UZ)", source_id=b.ia_id,
-                        languages=["uz"],
-                    ))
-                if len(accessible) >= limit:
-                    break
+
+            # FIXED: то же самое — параллелим проверку доступности.
+            flags = await asyncio.gather(
+                *[archive_uz.is_accessible(b.ia_id) for b in results],
+                return_exceptions=True,
+            )
+            accessible = [
+                UnifiedBook(
+                    title=b.title, author=b.author, cover_url=b.cover_url,
+                    source="Archive.org (UZ)", source_id=b.ia_id,
+                    languages=["uz"],
+                )
+                for b, ok in zip(results, flags) if ok is True
+            ][:limit]
+
             return accessible
         except Exception as e:
             logger.error(f"Archive UZ error: {e}")
-        return [] 
+            return []
 
     async def _search_imwerden(self, query: str, limit: int) -> list[UnifiedBook]:
         try:
@@ -297,5 +361,16 @@ class BookAggregator:
         lang = lang if lang in COPYRIGHT_MSG else "ru"
         return COPYRIGHT_MSG[lang].format(title=title)
 
+    def get_download_failed_message(self, book: "UnifiedBook", lang: str) -> str:
+        """
+        FIXED: новый метод, который различает причину неудачного скачивания.
+        Раньше всегда показывалось сообщение про копирайт, даже для источников
+        типа Gutenberg/Standard Ebooks/Archive.org, где это просто технический сбой.
+        """
+        lang_key = lang if lang in COPYRIGHT_MSG else "ru"
+        if book.source in _COPYRIGHT_CAPABLE_SOURCES:
+            return COPYRIGHT_MSG[lang_key].format(title=book.title)
+        return TECH_ERROR_MSG[lang_key].format(title=book.title)
 
-aggregator = BookAggregator() 
+
+aggregator = BookAggregator()  

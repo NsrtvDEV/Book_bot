@@ -2,6 +2,7 @@ import hashlib
 import logging
 from collections import OrderedDict
 
+from aiogram.filters import StateFilter
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
@@ -16,12 +17,17 @@ from sqlalchemy import select, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Book, BookLanguageEnum, DownloadHistory, Rating, User
-from app.services.aggregator import aggregator, UnifiedBook, SOURCE_EMOJI, detect_query_language
+from app.services.aggregator import (
+    aggregator,
+    UnifiedBook,
+    SOURCE_EMOJI,
+    detect_query_language,
+    normalize_title,
+)
 
 logger = logging.getLogger(__name__)
 router = Router()
 
-# ИЗМЕНЕНО: OrderedDict с ограничением размера вместо безграничного dict
 _ext_cache: OrderedDict[str, UnifiedBook] = OrderedDict()
 _EXT_CACHE_MAX = 2000
 
@@ -33,23 +39,24 @@ def _cache_external_book(book_hash: str, book: UnifiedBook) -> None:
         _ext_cache.popitem(last=False)
 
 
-def not_found_buttons(lang: str) -> InlineKeyboardMarkup:
-    texts = {
-        "uz": "📂 Kategoriyalar",
-        "ru": "📂 Категории",
-        "en": "📂 Categories",
-    }
-    t = texts.get(lang, texts["ru"])
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=t, callback_data="show_categories")],
-    ]) 
+def _resolve_book_language(languages: list[str] | None) -> BookLanguageEnum:
+    """
+    FIXED: раньше проверялось только "ru" в списке языков, и любая узбекская
+    книга (languages=["uz"]) молча записывалась как BookLanguageEnum.EN.
+    """
+    langs = languages or []
+    if "uz" in langs and hasattr(BookLanguageEnum, "UZ"):
+        return BookLanguageEnum.UZ
+    if "ru" in langs:
+        return BookLanguageEnum.RU
+    return BookLanguageEnum.EN
 
 
 # ──────────────────────────────────────────────
 # Поиск — любой текст
 # ──────────────────────────────────────────────
 
-@router.message(F.text & ~F.text.startswith("/"))
+@router.message(StateFilter(None), F.text & ~F.text.startswith("/"))
 async def handle_search(
     message: Message, state: FSMContext, session: AsyncSession, user: User, lang: str
 ) -> None:
@@ -97,7 +104,7 @@ async def handle_search(
         # 2. Внешние источники — догружаются следом
         query_lang = detect_query_language(query)
         external_books = await aggregator.search_all(query, lang=query_lang, limit_per_source=2)
-        logger.info(f"[SEARCH] query={query!r} ui_lang={lang} query_lang={query_lang}")
+        logger.info(f"[SEARCH] query={query!r} ui_lang={lang} query_lang={query_lang} external_total={len(external_books)}")
 
     if not local_books and not external_books:
         not_found = {
@@ -105,15 +112,18 @@ async def handle_search(
             "ru": "😔 Ничего не найдено. Попробуйте другой запрос.",
             "en": "😔 Nothing found. Try a different query.",
         }
-        await message.answer(not_found[lang], reply_markup=not_found_buttons(lang))
+        await message.answer(not_found[lang])
         return
 
     if not local_books and external_books:
         await message.answer(header[lang])
 
-    local_titles = {b.title.lower()[:20] for b in local_books}
+    # FIXED: раньше дедуп шёл по первым 20 символам названия (lower()[:20]),
+    # из-за чего разные книги с похожим началом названия считались дубликатами.
+    # Сравниваем полное нормализованное название.
+    local_titles = {normalize_title(b.title) for b in local_books}
     for book in external_books:
-        if book.title.lower()[:20] not in local_titles:
+        if normalize_title(book.title) not in local_titles:
             try:
                 await _send_external_card(message, book, lang)
             except Exception as e:
@@ -153,8 +163,10 @@ async def _send_external_card(message: Message, book: UnifiedBook, lang: str) ->
     lines.append(f"<i>{emoji} {book.source}</i>")
     caption = "\n".join(lines)
 
-    book_hash = hashlib.md5(book.source_id.encode()).hexdigest()[:8]
-    _cache_external_book(book_hash, book)  # ИЗМЕНЕНО: через LRU-кэш
+    # FIXED: 8 hex символов md5 = 32 бита — при кэше на 2000 записей риск коллизии
+    # уже не нулевой. Берём 12 символов (48 бит) — практически безопасно.
+    book_hash = hashlib.md5(book.source_id.encode()).hexdigest()[:12]
+    _cache_external_book(book_hash, book)
 
     buttons = [[InlineKeyboardButton(
         text=f"{get_text[lang]} — {emoji} {book.source}",
@@ -254,12 +266,26 @@ async def download_external(
             pass
 
         if not file_bytes:
-            copyright_msg = aggregator.get_copyright_message(book.title, lang)
-            await callback.message.answer(copyright_msg, disable_web_page_preview=True)
+            # FIXED: раньше ЛЮБАЯ неудача скачивания (сеть, таймаут, файл удалён)
+            # показывала пользователю "книга защищена копирайтом" и ссылку купить
+            # на Amazon — даже для книг с Archive.org/Gutenberg/Standard Ebooks,
+            # которые по определению public domain. Теперь сообщение зависит
+            # от источника: copyright — только для Open Library (там реально
+            # бывают lending-only книги без полного скачивания), для остальных —
+            # обычная "не получилось скачать, попробуйте позже".
+            fail_msg = aggregator.get_download_failed_message(book, lang)
+            await callback.message.answer(fail_msg, disable_web_page_preview=True)
             return
 
-        ext = ".epub" if book.source == "Standard Ebooks" else ".pdf"
-        safe_title = "".join(c for c in book.title if c.isalnum() or c in " -_")[:50]
+        # FIXED: расширение раньше определялось жёстко по имени источника
+        # (".epub" только для Standard Ebooks, иначе всегда ".pdf"), хотя
+        # Project Gutenberg может отдать source_id, который на самом деле
+        # ссылка на .epub — файл скачивался epub, а назывался .pdf.
+        ext = ".epub" if book.source_id.lower().endswith(".epub") else ".pdf"
+
+        # FIXED: если в названии книги только спецсимволы, safe_title мог
+        # стать пустой строкой — итоговое имя файла было бы просто ".pdf".
+        safe_title = "".join(c for c in book.title if c.isalnum() or c in " -_").strip()[:50] or "book"
         file = BufferedInputFile(file_bytes, filename=f"{safe_title}{ext}")
         emoji = SOURCE_EMOJI.get(book.source, "📚")
 
@@ -282,7 +308,7 @@ async def download_external(
             author=book.author,
             telegram_file_id=sent.document.file_id,
             file_size_kb=len(file_bytes) // 1024,
-            language=BookLanguageEnum.RU if "ru" in (book.languages or []) else BookLanguageEnum.EN,
+            language=_resolve_book_language(book.languages),
             download_count=1,
         )
         session.add(new_book)
@@ -350,5 +376,4 @@ async def rate_book(
         "en": f"✅ Thanks! Your rating: {'⭐' * score}",
     }
     await callback.message.edit_text(text[lang])
-    await callback.answer() 
-    
+    await callback.answer()

@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from aiogram import Router, F
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
@@ -14,6 +16,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import User, LanguageEnum
 
 router = Router()
+
+# FIXED: раньше "новый пользователь" определялся как user.created_at == user.updated_at.
+# Это хрупко: если поля выставляются БД отдельными вызовами func.now() с разной
+# точностью (или есть малейшая задержка между INSERT и тем, как ORM прочитал значения),
+# равенство может не выполниться для реально нового юзера, и он не увидит выбор языка.
+# Используем небольшой допуск по времени вместо точного равенства.
+NEW_USER_THRESHOLD = timedelta(seconds=1)
 
 
 class StartState(StatesGroup):
@@ -48,24 +57,21 @@ HELP_TEXT = {
         "• Kitob nomi yoki muallif yozing\n"
         "• Bot barcha manbalarda qidiradi\n"
         "• Kitobni yuklab oling va baholang ⭐\n\n"
-        "🌐 /lang — tilni o'zgartirish\n"
-        "📂 /categories — kategoriyalar"
+        "🌐 /lang — tilni o'zgartirish"
     ),
     "ru": (
         "📖 <b>Как пользоваться:</b>\n\n"
         "• Напишите название книги или автора\n"
         "• Бот ищет во всех источниках\n"
         "• Скачайте книгу и оцените её ⭐\n\n"
-        "🌐 /lang — сменить язык\n"
-        "📂 /categories — категории"
+        "🌐 /lang — сменить язык"
     ),
     "en": (
         "📖 <b>How to use:</b>\n\n"
         "• Type a book title or author\n"
         "• Bot searches all sources\n"
         "• Download and rate the book ⭐\n\n"
-        "🌐 /lang — change language\n"
-        "📂 /categories — categories"
+        "🌐 /lang — change language"
     ),
 }
 
@@ -86,7 +92,8 @@ def lang_keyboard() -> InlineKeyboardMarkup:
 async def cmd_start(message: Message, user: User, lang: str, state: FSMContext) -> None:
     await state.clear()
 
-    if user.created_at == user.updated_at:
+    # Если юзер новый — сначала выбор языка
+    if (user.updated_at - user.created_at) < NEW_USER_THRESHOLD:
         await message.answer(
             "🌐 Tilni tanlang / Выберите язык / Choose language:",
             reply_markup=lang_keyboard(),
@@ -136,50 +143,4 @@ async def set_language(
 
 @router.message(F.text == "/help")
 async def cmd_help(message: Message, lang: str) -> None:
-    await message.answer(HELP_TEXT[lang])
-
-
-# ──────────────────────────────────────────────
-# /categories — категории
-# ──────────────────────────────────────────────
-
-@router.message(F.text == "/categories")
-async def cmd_categories(message: Message, session: AsyncSession, lang: str) -> None:
-    await _send_categories(message, session, lang)
-
-
-@router.callback_query(F.data == "show_categories")
-async def cb_show_categories(callback: CallbackQuery, session: AsyncSession, lang: str) -> None:
-    await _send_categories(callback.message, session, lang)
-    await callback.answer()
-
-
-async def _send_categories(message: Message, session: AsyncSession, lang: str) -> None:
-    from sqlalchemy import select
-    from app.models import Category
-
-    result = await session.execute(
-        select(Category).where(Category.is_active == True).order_by(Category.sort_order)
-    )
-    categories = result.scalars().all()
-
-    if not categories:
-        await message.answer("Категории пока не добавлены.")
-        return
-
-    buttons = [
-        [InlineKeyboardButton(
-            text=f"{cat.emoji or ''} {cat.get_name(lang)}",
-            callback_data=f"category:{cat.id}",
-        )]
-        for cat in categories
-    ]
-    text = {
-        "uz": "📂 Kategoriyani tanlang:",
-        "ru": "📂 Выберите категорию:",
-        "en": "📂 Choose a category:",
-    }
-    await message.answer(
-        text[lang],
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-    )
+    await message.answer(HELP_TEXT[lang]) 
