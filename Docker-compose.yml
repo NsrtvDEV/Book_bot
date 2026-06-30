@@ -1,0 +1,22 @@
+services:
+  bot:
+    build: .
+    env_file:
+      - .env
+    restart: unless-stopped
+    # Если используешь Supabase — отдельная локальная БД в compose не нужна,
+    # просто укажи DATABASE_URL на Supabase в .env.
+    # Ниже — опциональный локальный Postgres для тестов ДО переноса в облако.
+  # db:
+  #   image: postgres:16-alpine
+  #   environment:
+  #     POSTGRES_USER: postgres
+  #     POSTGRES_PASSWORD: postgres
+  #     POSTGRES_DB: kitobchi
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - pg_data:/var/lib/postgresql/data
+
+# volumes:
+#   pg_data:
